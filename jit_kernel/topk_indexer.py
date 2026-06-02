@@ -73,3 +73,44 @@ def fast_topk_v3(
 
     module.fast_topk(score, topk_indices, lengths, row_starts)
     return topk_indices
+
+
+def fast_topk_transform_fused_v3(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table_size_1: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert (
+        topk == 2048
+    ), "fast_topk_transform_fused_v3 is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+
+    dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
+    module = _jit_fast_topk_v3_module()
+    module.fast_topk_transform_fused(
+        score, lengths, dst_page_table, page_table_size_1, cu_seqlens_q, row_starts
+    )
+    return dst_page_table
+
+
+def fast_topk_transform_ragged_fused_v3(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk_indices_offset: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert (
+        topk == 2048
+    ), "fast_topk_transform_ragged_fused_v3 is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+
+    topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
+    module = _jit_fast_topk_v3_module()
+    module.fast_topk_transform_ragged_fused(
+        score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
+    )
+    return topk_indices_ragged

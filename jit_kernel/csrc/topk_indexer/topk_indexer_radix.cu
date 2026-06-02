@@ -183,6 +183,18 @@ __device__ void naive_topk_transform_ragged(
   }
 }
 
+__device__ __forceinline__ bool should_write_split_kv_output(bool use_split_kv) {
+  if (!use_split_kv) {
+    return true;
+  }
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+  return cluster.block_rank() == 0;
+#else
+  return blockIdx.y == 0;
+#endif
+}
+
 __device__ __forceinline__ auto convert_to_monotonic_8bit(float x) -> uint8_t;
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
@@ -873,7 +885,9 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
         const FastTopKParams params,
         int32_t* __restrict__ dst_page_table,
         const int32_t* __restrict__ src_page_table,
-        const int64_t src_stride) {
+        const int64_t src_stride,
+        int* g_scratch,
+        bool use_split_kv) {
   const auto& [input, _1, _2, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
@@ -883,11 +897,17 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   const auto dst_page_entry = dst_page_table + bid * TopK;
   const auto score = input + bid * input_stride;
   if (length <= TopK) {
+    if (!should_write_split_kv_output(use_split_kv)) {
+      return;
+    }
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
 
-    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
+    if (!should_write_split_kv_output(use_split_kv)) {
+      return;
+    }
 
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
@@ -910,7 +930,9 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
         const int32_t* __restrict__ src_page_table,
         const int64_t src_stride,
         const int32_t* __restrict__ cu_seqlens_q,
-        const int64_t prefill_bs) {
+        const int64_t prefill_bs,
+        int* g_scratch,
+        bool use_split_kv) {
   const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
@@ -939,11 +961,17 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
   const auto src_page_entry = s_src_page_entry;
 
   if (length <= TopK) {
+    if (!should_write_split_kv_output(use_split_kv)) {
+      return;
+    }
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
 
-    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
+    if (!should_write_split_kv_output(use_split_kv)) {
+      return;
+    }
 
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
@@ -963,7 +991,9 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     void topk_transform_prefill_ragged_kernel(
         const FastTopKParams params,
         int32_t* __restrict__ topk_indices_ragged,
-        const int32_t* __restrict__ topk_indices_offset) {
+        const int32_t* __restrict__ topk_indices_offset,
+        int* g_scratch,
+        bool use_split_kv) {
   const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
@@ -974,11 +1004,17 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
   const auto offset = topk_indices_offset[bid];
 
   if (length <= TopK) {
+    if (!should_write_split_kv_output(use_split_kv)) {
+      return;
+    }
     return naive_topk_transform_ragged(score, length, dst_indices_entry, offset);
   } else {
     __shared__ int s_indices[TopK];
 
-    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
+    if (!should_write_split_kv_output(use_split_kv)) {
+      return;
+    }
 
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
@@ -1042,6 +1078,102 @@ void setup_kernel_smem_once() {
 #endif
   }();
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+}
+
+unsigned int get_topk_split_kv(int64_t B) {
+#if ENABLE_HOPPER
+  constexpr int max_kv_split = 8;
+#else
+  const int max_kv_split = SMs;
+#endif
+
+  unsigned int split_kv = 1;
+  if (B < SMs) {
+    split_kv = CEILDIV(SMs, B);
+    split_kv = MIN(split_kv, max_kv_split);
+
+#if ENABLE_HOPPER
+    if (B >= 64) {
+      split_kv = MIN(split_kv, 2);
+    } else if (B >= 32) {
+      split_kv = MIN(split_kv, 4);
+    } else {
+      split_kv = MIN(split_kv, 8);
+    }
+#else
+    if (B >= 64) {
+      split_kv = MIN(split_kv, 2);
+    } else if (B >= 32) {
+      split_kv = MIN(split_kv, 4);
+    } else if (B >= 16) {
+      split_kv = MIN(split_kv, 8);
+    } else if (B >= 8) {
+      split_kv = MIN(split_kv, 16);
+    } else if (B >= 4) {
+      split_kv = MIN(split_kv, 32);
+    } else if (B >= 2) {
+      split_kv = MIN(split_kv, 64);
+    } else {
+      split_kv = MIN(split_kv, 128);
+    }
+#endif
+  }
+  return split_kv;
+}
+
+template <typename Kernel, typename... Args>
+void launch_split_kv_kernel(
+    Kernel kernel,
+    dim3 grid,
+    dim3 block,
+    size_t smem,
+    cudaStream_t stream,
+    uint64_t B,
+    unsigned int split_kv,
+    Args... args) {
+#if ENABLE_HOPPER && CUDART_VERSION >= 12000
+  int device = 0;
+  int major = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+
+  if (major >= 9) {
+    cudaLaunchConfig_t config = {0};
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = smem;
+    config.stream = stream;
+
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim = {1, split_kv, 1};
+    config.attrs = attr;
+    config.numAttrs = 1;
+
+    const auto launch_result = cudaLaunchKernelEx(&config, kernel, args..., nullptr, split_kv > 1);
+    TORCH_CHECK(launch_result == cudaSuccess, "topk cluster launch failed:", ::cudaGetErrorString(launch_result));
+    return;
+  }
+#endif
+
+  int* scratch_ptr = nullptr;
+  if (split_kv > 1) {
+    const auto scratch_bytes = static_cast<size_t>(B) * split_kv * RADIX * sizeof(int);
+    auto malloc_result = cudaMallocAsync(reinterpret_cast<void**>(&scratch_ptr), scratch_bytes, stream);
+    TORCH_CHECK(malloc_result == cudaSuccess, "topk scratch allocation failed:", ::cudaGetErrorString(malloc_result));
+  }
+
+  bool use_split_kv = split_kv > 1;
+  void* kernel_args[] = {
+      reinterpret_cast<void*>(&args)..., reinterpret_cast<void*>(&scratch_ptr), reinterpret_cast<void*>(&use_split_kv)};
+
+  const auto launch_result = cudaLaunchCooperativeKernel((void*)kernel, grid, block, kernel_args, smem, stream);
+  TORCH_CHECK(launch_result == cudaSuccess, "topk cooperative launch failed:", ::cudaGetErrorString(launch_result));
+
+  if (scratch_ptr != nullptr) {
+    auto free_result = cudaFreeAsync(scratch_ptr, stream);
+    TORCH_CHECK(free_result == cudaSuccess, "topk scratch free failed:", ::cudaGetErrorString(free_result));
+  }
 }
 
 }  // namespace
@@ -1185,7 +1317,8 @@ void fast_topk_transform_interface(
 
   // launch kernel
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto grid = dim3{static_cast<uint32_t>(B)};
+  const auto split_kv = get_topk_split_kv(B);
+  const auto grid = dim3{static_cast<uint32_t>(B), split_kv, 1};
   const auto block = dim3{kThreadsPerBlock};
   const auto src_stride = src_page_table.stride(0);
 
@@ -1196,11 +1329,28 @@ void fast_topk_transform_interface(
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
   if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
-    topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
-        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+    launch_split_kv_kernel(
+        topk_transform_decode_kernel,
+        grid,
+        block,
+        kSmem,
+        stream,
+        B,
+        split_kv,
+        params,
+        dst_page_table.data_ptr<int32_t>(),
+        src_page_table.data_ptr<int32_t>(),
+        src_stride);
   } else {
     setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
-    topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
+    launch_split_kv_kernel(
+        topk_transform_prefill_kernel,
+        grid,
+        block,
+        kSmem,
+        stream,
+        B,
+        split_kv,
         params,
         dst_page_table.data_ptr<int32_t>(),
         src_page_table.data_ptr<int32_t>(),
@@ -1238,12 +1388,22 @@ void fast_topk_transform_ragged_interface(
 
   // launch kernel
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto grid = dim3{static_cast<uint32_t>(B)};
+  const auto split_kv = get_topk_split_kv(B);
+  const auto grid = dim3{static_cast<uint32_t>(B), split_kv, 1};
   const auto block = dim3{kThreadsPerBlock};
 
   setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
-  topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
-      params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  launch_split_kv_kernel(
+      topk_transform_prefill_ragged_kernel,
+      grid,
+      block,
+      kSmem,
+      stream,
+      B,
+      split_kv,
+      params,
+      topk_indices_ragged.data_ptr<int32_t>(),
+      topk_indices_offset.data_ptr<int32_t>());
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
