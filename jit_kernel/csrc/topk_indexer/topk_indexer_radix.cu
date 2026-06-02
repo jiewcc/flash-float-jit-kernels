@@ -195,6 +195,31 @@ __device__ __forceinline__ bool should_write_split_kv_output(bool use_split_kv) 
 #endif
 }
 
+__device__ __forceinline__ void gather_split_kv_shared_indices(int* s_indices, bool use_split_kv) {
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  if (!use_split_kv) {
+    return;
+  }
+  auto cluster = cooperative_groups::this_cluster();
+  cluster.sync();
+  if (cluster.block_rank() == 0) {
+    for (int r = 1; r < cluster.num_blocks(); ++r) {
+      int* remote_indices = cluster.map_shared_rank(s_indices, r);
+      for (auto i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
+        const auto pos = remote_indices[i];
+        if (pos >= 0) {
+          s_indices[i] = pos;
+        }
+      }
+    }
+  }
+  cluster.sync();
+#else
+  (void)s_indices;
+  (void)use_split_kv;
+#endif
+}
+
 __device__ __forceinline__ auto convert_to_monotonic_8bit(float x) -> uint8_t;
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
@@ -909,6 +934,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     __syncthreads();
 
     fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
+    gather_split_kv_shared_indices(s_indices, use_split_kv);
     if (!should_write_split_kv_output(use_split_kv)) {
       return;
     }
@@ -970,6 +996,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     __syncthreads();
 
     fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
+    gather_split_kv_shared_indices(s_indices, use_split_kv);
     if (!should_write_split_kv_output(use_split_kv)) {
       return;
     }
@@ -1010,6 +1037,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     __syncthreads();
 
     fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
+    gather_split_kv_shared_indices(s_indices, use_split_kv);
     if (!should_write_split_kv_output(use_split_kv)) {
       return;
     }
