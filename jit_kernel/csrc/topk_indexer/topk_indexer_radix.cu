@@ -903,6 +903,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
+    for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+      s_indices[i] = -1;
+    }
+    __syncthreads();
 
     fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
     if (!should_write_split_kv_output(use_split_kv)) {
@@ -916,10 +920,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
 
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = src_page_entry[pos_0];
+    dst_page_entry[idx_0] = pos_0 >= 0 ? src_page_entry[pos_0] : -1;
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = src_page_entry[pos_1];
+    dst_page_entry[idx_1] = pos_1 >= 0 ? src_page_entry[pos_1] : -1;
   }
 }
 
@@ -967,6 +971,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
+    for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+      s_indices[i] = -1;
+    }
+    __syncthreads();
 
     fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
     if (!should_write_split_kv_output(use_split_kv)) {
@@ -980,10 +988,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
 
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = src_page_entry[pos_0];
+    dst_page_entry[idx_0] = pos_0 >= 0 ? src_page_entry[pos_0] : -1;
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = src_page_entry[pos_1];
+    dst_page_entry[idx_1] = pos_1 >= 0 ? src_page_entry[pos_1] : -1;
   }
 }
 
@@ -1010,6 +1018,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     return naive_topk_transform_ragged(score, length, dst_indices_entry, offset);
   } else {
     __shared__ int s_indices[TopK];
+    for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+      s_indices[i] = -1;
+    }
+    __syncthreads();
 
     fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length, TopK, g_scratch, use_split_kv);
     if (!should_write_split_kv_output(use_split_kv)) {
@@ -1023,10 +1035,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
 
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    dst_indices_entry[idx_0] = pos_0 + offset;
+    dst_indices_entry[idx_0] = pos_0 >= 0 ? pos_0 + offset : -1;
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    dst_indices_entry[idx_1] = pos_1 + offset;
+    dst_indices_entry[idx_1] = pos_1 >= 0 ? pos_1 + offset : -1;
   }
 }
 
