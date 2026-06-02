@@ -913,17 +913,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
       return;
     }
 
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-
-    // static_assert(TopK / kThreadsPerBlock == 2);
-
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = pos_0 >= 0 ? src_page_entry[pos_0] : -1;
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = pos_1 >= 0 ? src_page_entry[pos_1] : -1;
+    for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+      const auto pos = s_indices[i];
+      dst_page_entry[i] = pos >= 0 ? src_page_entry[pos] : -1;
+    }
   }
 }
 
@@ -981,17 +974,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
       return;
     }
 
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-
-    // static_assert(TopK / kThreadsPerBlock == 2);
-
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = pos_0 >= 0 ? src_page_entry[pos_0] : -1;
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = pos_1 >= 0 ? src_page_entry[pos_1] : -1;
+    for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+      const auto pos = s_indices[i];
+      dst_page_entry[i] = pos >= 0 ? src_page_entry[pos] : -1;
+    }
   }
 }
 
@@ -1028,17 +1014,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
       return;
     }
 
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-
-    // static_assert(TopK / kThreadsPerBlock == 2);
-
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_indices_entry[idx_0] = pos_0 >= 0 ? pos_0 + offset : -1;
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_indices_entry[idx_1] = pos_1 >= 0 ? pos_1 + offset : -1;
+    for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
+      const auto pos = s_indices[i];
+      dst_indices_entry[i] = pos >= 0 ? pos + offset : -1;
+    }
   }
 }
 
